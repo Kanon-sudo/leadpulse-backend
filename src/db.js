@@ -27,11 +27,53 @@ export const pool = new Pool({
   idleTimeoutMillis: 30_000,
 });
 
+let billingSchemaEnsured = false;
+
+const billingSchemaSql = `
+  create table if not exists workspace_billing (
+    workspace_id uuid primary key references workspaces(id) on delete cascade,
+    stripe_customer_id text unique,
+    stripe_subscription_id text unique,
+    stripe_price_id text,
+    stripe_product_id text,
+    stripe_status text not null default 'inactive',
+    billing_email text,
+    current_period_start timestamptz,
+    current_period_end timestamptz,
+    cancel_at_period_end boolean not null default false,
+    trial_start timestamptz,
+    trial_end timestamptz,
+    raw_subscription jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  );
+
+  create table if not exists stripe_event_log (
+    event_id text primary key,
+    event_type text not null,
+    workspace_id uuid references workspaces(id) on delete set null,
+    payload jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now()
+  );
+
+  create index if not exists workspace_billing_status_idx on workspace_billing (stripe_status, current_period_end desc);
+  create index if not exists stripe_event_log_workspace_id_idx on stripe_event_log (workspace_id, created_at desc);
+`;
+
 export async function pingDatabase() {
   const result = await pool.query(
     "select current_database() as database, current_user as user, now() as server_time"
   );
   return result.rows[0];
+}
+
+export async function ensureBillingSchema() {
+  if (billingSchemaEnsured) {
+    return;
+  }
+
+  await pool.query(billingSchemaSql);
+  billingSchemaEnsured = true;
 }
 
 function slugifyWorkspaceName(value) {
@@ -160,4 +202,272 @@ export async function syncUserSession(session) {
   } finally {
     client.release();
   }
+}
+
+function mapWorkspaceBillingRow(row) {
+  if (!row) {
+    return {
+      stripeCustomerId: "",
+      stripeSubscriptionId: "",
+      stripePriceId: "",
+      stripeProductId: "",
+      stripeStatus: "inactive",
+      billingEmail: "",
+      currentPeriodStart: null,
+      currentPeriodEnd: null,
+      cancelAtPeriodEnd: false,
+      trialStart: null,
+      trialEnd: null,
+      createdAt: null,
+      updatedAt: null,
+      rawSubscription: {},
+    };
+  }
+
+  return {
+    stripeCustomerId: row.stripe_customer_id || "",
+    stripeSubscriptionId: row.stripe_subscription_id || "",
+    stripePriceId: row.stripe_price_id || "",
+    stripeProductId: row.stripe_product_id || "",
+    stripeStatus: row.stripe_status || "inactive",
+    billingEmail: row.billing_email || "",
+    currentPeriodStart: row.current_period_start || null,
+    currentPeriodEnd: row.current_period_end || null,
+    cancelAtPeriodEnd: Boolean(row.cancel_at_period_end),
+    trialStart: row.trial_start || null,
+    trialEnd: row.trial_end || null,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    rawSubscription: row.raw_subscription || {},
+  };
+}
+
+async function selectWorkspaceBillingSnapshot(workspaceId, client = pool) {
+  const result = await client.query(
+    `
+      select
+        w.id,
+        w.slug,
+        w.name,
+        w.plan_key,
+        w.status,
+        wb.stripe_customer_id,
+        wb.stripe_subscription_id,
+        wb.stripe_price_id,
+        wb.stripe_product_id,
+        wb.stripe_status,
+        wb.billing_email,
+        wb.current_period_start,
+        wb.current_period_end,
+        wb.cancel_at_period_end,
+        wb.trial_start,
+        wb.trial_end,
+        wb.raw_subscription,
+        wb.created_at,
+        wb.updated_at
+      from workspaces w
+      left join workspace_billing wb on wb.workspace_id = w.id
+      where w.id = $1
+      limit 1
+    `,
+    [workspaceId]
+  );
+
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+
+  return {
+    workspace: {
+      id: row.id,
+      slug: row.slug,
+      name: row.name,
+      planKey: row.plan_key,
+      status: row.status,
+    },
+    billing: mapWorkspaceBillingRow(row),
+  };
+}
+
+export async function getWorkspaceBillingSnapshot(workspaceId) {
+  return selectWorkspaceBillingSnapshot(workspaceId);
+}
+
+export async function upsertWorkspaceBillingCustomer({ workspaceId, stripeCustomerId, billingEmail = "" }) {
+  await pool.query(
+    `
+      insert into workspace_billing (workspace_id, stripe_customer_id, billing_email, updated_at)
+      values ($1, $2, $3, now())
+      on conflict (workspace_id)
+      do update set
+        stripe_customer_id = excluded.stripe_customer_id,
+        billing_email = coalesce(excluded.billing_email, workspace_billing.billing_email),
+        updated_at = now()
+    `,
+    [workspaceId, stripeCustomerId, billingEmail || null]
+  );
+
+  return selectWorkspaceBillingSnapshot(workspaceId);
+}
+
+export async function upsertWorkspaceBillingSubscription({
+  workspaceId,
+  stripeCustomerId = "",
+  stripeSubscriptionId = "",
+  stripePriceId = "",
+  stripeProductId = "",
+  stripeStatus = "inactive",
+  billingEmail = "",
+  currentPeriodStart = null,
+  currentPeriodEnd = null,
+  cancelAtPeriodEnd = false,
+  trialStart = null,
+  trialEnd = null,
+  rawSubscription = {},
+  planKey = "",
+}) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("begin");
+
+    await client.query(
+      `
+        insert into workspace_billing (
+          workspace_id,
+          stripe_customer_id,
+          stripe_subscription_id,
+          stripe_price_id,
+          stripe_product_id,
+          stripe_status,
+          billing_email,
+          current_period_start,
+          current_period_end,
+          cancel_at_period_end,
+          trial_start,
+          trial_end,
+          raw_subscription,
+          updated_at
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, now())
+        on conflict (workspace_id)
+        do update set
+          stripe_customer_id = coalesce(excluded.stripe_customer_id, workspace_billing.stripe_customer_id),
+          stripe_subscription_id = excluded.stripe_subscription_id,
+          stripe_price_id = excluded.stripe_price_id,
+          stripe_product_id = excluded.stripe_product_id,
+          stripe_status = excluded.stripe_status,
+          billing_email = coalesce(excluded.billing_email, workspace_billing.billing_email),
+          current_period_start = excluded.current_period_start,
+          current_period_end = excluded.current_period_end,
+          cancel_at_period_end = excluded.cancel_at_period_end,
+          trial_start = excluded.trial_start,
+          trial_end = excluded.trial_end,
+          raw_subscription = excluded.raw_subscription,
+          updated_at = now()
+      `,
+      [
+        workspaceId,
+        stripeCustomerId || null,
+        stripeSubscriptionId || null,
+        stripePriceId || null,
+        stripeProductId || null,
+        stripeStatus,
+        billingEmail || null,
+        currentPeriodStart,
+        currentPeriodEnd,
+        cancelAtPeriodEnd,
+        trialStart,
+        trialEnd,
+        JSON.stringify(rawSubscription || {}),
+      ]
+    );
+
+    if (planKey) {
+      await client.query(
+        `
+          update workspaces
+          set plan_key = $2, updated_at = now()
+          where id = $1
+        `,
+        [workspaceId, planKey]
+      );
+    }
+
+    await client.query("commit");
+    return selectWorkspaceBillingSnapshot(workspaceId, client);
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function findWorkspaceBillingByStripeCustomerId(stripeCustomerId) {
+  const result = await pool.query(
+    `
+      select
+        w.id,
+        w.slug,
+        w.name,
+        w.plan_key,
+        w.status,
+        wb.stripe_customer_id,
+        wb.stripe_subscription_id,
+        wb.stripe_price_id,
+        wb.stripe_product_id,
+        wb.stripe_status,
+        wb.billing_email,
+        wb.current_period_start,
+        wb.current_period_end,
+        wb.cancel_at_period_end,
+        wb.trial_start,
+        wb.trial_end,
+        wb.raw_subscription,
+        wb.created_at,
+        wb.updated_at
+      from workspace_billing wb
+      join workspaces w on w.id = wb.workspace_id
+      where wb.stripe_customer_id = $1
+      limit 1
+    `,
+    [stripeCustomerId]
+  );
+
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+
+  return {
+    workspace: {
+      id: row.id,
+      slug: row.slug,
+      name: row.name,
+      planKey: row.plan_key,
+      status: row.status,
+    },
+    billing: mapWorkspaceBillingRow(row),
+  };
+}
+
+export async function hasStripeEventBeenProcessed(eventId) {
+  const result = await pool.query(
+    "select 1 from stripe_event_log where event_id = $1 limit 1",
+    [eventId]
+  );
+  return Boolean(result.rows[0]);
+}
+
+export async function logStripeEvent({ eventId, eventType, workspaceId = null, payload = {} }) {
+  await pool.query(
+    `
+      insert into stripe_event_log (event_id, event_type, workspace_id, payload)
+      values ($1, $2, $3, $4::jsonb)
+      on conflict (event_id) do nothing
+    `,
+    [eventId, eventType, workspaceId, JSON.stringify(payload || {})]
+  );
 }

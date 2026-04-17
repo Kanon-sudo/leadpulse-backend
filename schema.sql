@@ -44,5 +44,33 @@ create table if not exists access_events (
   created_at timestamptz not null default now()
 );
 
+create table if not exists workspace_billing (
+  workspace_id uuid primary key references workspaces(id) on delete cascade,
+  stripe_customer_id text unique,
+  stripe_subscription_id text unique,
+  stripe_price_id text,
+  stripe_product_id text,
+  stripe_status text not null default 'inactive',
+  billing_email text,
+  current_period_start timestamptz,
+  current_period_end timestamptz,
+  cancel_at_period_end boolean not null default false,
+  trial_start timestamptz,
+  trial_end timestamptz,
+  raw_subscription jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists stripe_event_log (
+  event_id text primary key,
+  event_type text not null,
+  workspace_id uuid references workspaces(id) on delete set null,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
 create index if not exists access_events_user_id_idx on access_events (user_id, created_at desc);
 create index if not exists access_events_workspace_id_idx on access_events (workspace_id, created_at desc);
+create index if not exists workspace_billing_status_idx on workspace_billing (stripe_status, current_period_end desc);
+create index if not exists stripe_event_log_workspace_id_idx on stripe_event_log (workspace_id, created_at desc);
