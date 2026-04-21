@@ -70,7 +70,28 @@ create table if not exists stripe_event_log (
   created_at timestamptz not null default now()
 );
 
+create table if not exists workspace_credits (
+  workspace_id uuid primary key references workspaces(id) on delete cascade,
+  included_credits integer not null default 0,
+  purchased_credits integer not null default 0,
+  bonus_credits integer not null default 0,
+  consumed_credits integer not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists workspace_credit_usage_events (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  usage_key text not null unique,
+  bucket_key text not null,
+  credits_consumed integer not null default 0,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
 create index if not exists access_events_user_id_idx on access_events (user_id, created_at desc);
 create index if not exists access_events_workspace_id_idx on access_events (workspace_id, created_at desc);
 create index if not exists workspace_billing_status_idx on workspace_billing (stripe_status, current_period_end desc);
 create index if not exists stripe_event_log_workspace_id_idx on stripe_event_log (workspace_id, created_at desc);
+create index if not exists workspace_credit_usage_workspace_id_idx on workspace_credit_usage_events (workspace_id, created_at desc);

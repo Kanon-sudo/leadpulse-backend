@@ -1,6 +1,6 @@
 import http from "node:http";
 import { URL } from "node:url";
-import { ensureBillingSchema, pingDatabase, syncUserSession } from "./db.js";
+import { consumeWorkspaceCredits, ensureBillingSchema, pingDatabase, syncUserSession } from "./db.js";
 import { verifyFirebaseIdToken } from "./firebase-auth.js";
 import {
   createCheckoutSession,
@@ -147,6 +147,7 @@ const server = http.createServer(async (request, response) => {
         user: session.user,
         workspace: billing?.workspace || session.workspace,
         billing: billing?.billing || null,
+        credits: billing?.credits || null,
       });
       return;
     }
@@ -182,6 +183,45 @@ const server = http.createServer(async (request, response) => {
       json(response, 200, {
         ok: true,
         portal,
+      });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/credits/consume") {
+      const { body, session } = await requireSession(request);
+      const usageKey = String(body.usageKey || "").trim();
+      const bucketKey = String(body.bucketKey || "").trim().toLowerCase();
+      const creditsConsumed = Number(body.creditsConsumed || 0);
+
+      if (!usageKey) {
+        json(response, 400, { ok: false, error: "Missing usageKey" });
+        return;
+      }
+
+      if (!["clean", "review", "remove"].includes(bucketKey)) {
+        json(response, 400, { ok: false, error: "Invalid bucketKey" });
+        return;
+      }
+
+      const outcome = await consumeWorkspaceCredits({
+        workspaceId: session.workspace.id,
+        planKey: session.workspace.planKey,
+        usageKey,
+        bucketKey,
+        creditsConsumed,
+        payload: {
+          sourceLabel: String(body.sourceLabel || ""),
+          contactsCount: Number(body.contactsCount || 0),
+          format: String(body.format || ""),
+        },
+      });
+
+      json(response, 200, {
+        ok: true,
+        duplicate: outcome.duplicate,
+        workspace: outcome.snapshot?.workspace || session.workspace,
+        billing: outcome.snapshot?.billing || null,
+        credits: outcome.snapshot?.credits || null,
       });
       return;
     }

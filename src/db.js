@@ -56,9 +56,36 @@ const billingSchemaSql = `
     created_at timestamptz not null default now()
   );
 
+  create table if not exists workspace_credits (
+    workspace_id uuid primary key references workspaces(id) on delete cascade,
+    included_credits integer not null default 0,
+    purchased_credits integer not null default 0,
+    bonus_credits integer not null default 0,
+    consumed_credits integer not null default 0,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  );
+
+  create table if not exists workspace_credit_usage_events (
+    id uuid primary key default gen_random_uuid(),
+    workspace_id uuid not null references workspaces(id) on delete cascade,
+    usage_key text not null unique,
+    bucket_key text not null,
+    credits_consumed integer not null default 0,
+    payload jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now()
+  );
+
   create index if not exists workspace_billing_status_idx on workspace_billing (stripe_status, current_period_end desc);
   create index if not exists stripe_event_log_workspace_id_idx on stripe_event_log (workspace_id, created_at desc);
+  create index if not exists workspace_credit_usage_workspace_id_idx on workspace_credit_usage_events (workspace_id, created_at desc);
 `;
+
+const PLAN_CREDITS = {
+  starter: 5000,
+  growth: 25000,
+  ops: 100000,
+};
 
 export async function pingDatabase() {
   const result = await pool.query(
@@ -242,7 +269,44 @@ function mapWorkspaceBillingRow(row) {
   };
 }
 
+function resolvePlanCredits(planKey) {
+  const normalizedPlanKey = String(planKey || "").trim().toLowerCase();
+  return PLAN_CREDITS[normalizedPlanKey] || 0;
+}
+
+function mapWorkspaceCreditsRow(row) {
+  const includedCredits = Math.max(Number(row?.included_credits || 0), 0);
+  const purchasedCredits = Math.max(Number(row?.purchased_credits || 0), 0);
+  const bonusCredits = Math.max(Number(row?.bonus_credits || 0), 0);
+  const consumedCredits = Math.max(Number(row?.consumed_credits || 0), 0);
+  const totalCredits = includedCredits + purchasedCredits + bonusCredits;
+  const availableCredits = Math.max(totalCredits - consumedCredits, 0);
+
+  return {
+    includedCredits,
+    purchasedCredits,
+    bonusCredits,
+    consumedCredits,
+    totalCredits,
+    availableCredits,
+    createdAt: row?.credits_created_at || row?.created_at || null,
+    updatedAt: row?.credits_updated_at || row?.updated_at || null,
+  };
+}
+
+async function ensureWorkspaceCreditsRow(client, workspaceId, planKey) {
+  await client.query(
+    `
+      insert into workspace_credits (workspace_id, included_credits, updated_at)
+      values ($1, $2, now())
+      on conflict (workspace_id) do nothing
+    `,
+    [workspaceId, resolvePlanCredits(planKey)]
+  );
+}
+
 async function selectWorkspaceBillingSnapshot(workspaceId, client = pool) {
+  await ensureBillingSchema();
   const result = await client.query(
     `
       select
@@ -264,9 +328,16 @@ async function selectWorkspaceBillingSnapshot(workspaceId, client = pool) {
         wb.trial_end,
         wb.raw_subscription,
         wb.created_at,
-        wb.updated_at
+        wb.updated_at,
+        wc.included_credits,
+        wc.purchased_credits,
+        wc.bonus_credits,
+        wc.consumed_credits,
+        wc.created_at as credits_created_at,
+        wc.updated_at as credits_updated_at
       from workspaces w
       left join workspace_billing wb on wb.workspace_id = w.id
+      left join workspace_credits wc on wc.workspace_id = w.id
       where w.id = $1
       limit 1
     `,
@@ -278,6 +349,17 @@ async function selectWorkspaceBillingSnapshot(workspaceId, client = pool) {
     return null;
   }
 
+  await ensureWorkspaceCreditsRow(client, row.id, row.plan_key);
+  const creditsResult = await client.query(
+    `
+      select included_credits, purchased_credits, bonus_credits, consumed_credits, created_at, updated_at
+      from workspace_credits
+      where workspace_id = $1
+      limit 1
+    `,
+    [workspaceId]
+  );
+
   return {
     workspace: {
       id: row.id,
@@ -287,6 +369,7 @@ async function selectWorkspaceBillingSnapshot(workspaceId, client = pool) {
       status: row.status,
     },
     billing: mapWorkspaceBillingRow(row),
+    credits: mapWorkspaceCreditsRow(creditsResult.rows[0]),
   };
 }
 
@@ -470,4 +553,113 @@ export async function logStripeEvent({ eventId, eventType, workspaceId = null, p
     `,
     [eventId, eventType, workspaceId, JSON.stringify(payload || {})]
   );
+}
+
+export async function consumeWorkspaceCredits({
+  workspaceId,
+  planKey = "",
+  usageKey,
+  bucketKey,
+  creditsConsumed,
+  payload = {},
+}) {
+  const normalizedCredits = Math.max(Number(creditsConsumed || 0), 0);
+  const client = await pool.connect();
+
+  try {
+    await client.query("begin");
+    await ensureWorkspaceCreditsRow(client, workspaceId, planKey);
+
+    const duplicateCheck = await client.query(
+      `
+        select id
+        from workspace_credit_usage_events
+        where usage_key = $1
+        limit 1
+      `,
+      [usageKey]
+    );
+
+    if (duplicateCheck.rows[0]) {
+      await client.query("commit");
+      return {
+        duplicate: true,
+        snapshot: await selectWorkspaceBillingSnapshot(workspaceId, client),
+      };
+    }
+
+    const creditsRowResult = await client.query(
+      `
+        select included_credits, purchased_credits, bonus_credits, consumed_credits
+        from workspace_credits
+        where workspace_id = $1
+        limit 1
+      `,
+      [workspaceId]
+    );
+
+    const creditsRow = creditsRowResult.rows[0];
+    const totalCredits = Math.max(Number(creditsRow?.included_credits || 0), 0)
+      + Math.max(Number(creditsRow?.purchased_credits || 0), 0)
+      + Math.max(Number(creditsRow?.bonus_credits || 0), 0);
+    const currentConsumed = Math.max(Number(creditsRow?.consumed_credits || 0), 0);
+    const availableCredits = Math.max(totalCredits - currentConsumed, 0);
+
+    if (normalizedCredits > availableCredits) {
+      throw new Error("Insufficient credits for this workspace");
+    }
+
+    await client.query(
+      `
+        insert into workspace_credit_usage_events (
+          workspace_id,
+          usage_key,
+          bucket_key,
+          credits_consumed,
+          payload
+        )
+        values ($1, $2, $3, $4, $5::jsonb)
+      `,
+      [workspaceId, usageKey, bucketKey, normalizedCredits, JSON.stringify(payload || {})]
+    );
+
+    if (normalizedCredits > 0) {
+      await client.query(
+        `
+          update workspace_credits
+          set consumed_credits = consumed_credits + $2,
+              updated_at = now()
+          where workspace_id = $1
+        `,
+        [workspaceId, normalizedCredits]
+      );
+    }
+
+    await client.query(
+      `
+        insert into access_events (workspace_id, event_type, source, payload)
+        values ($1, 'credits_consumed', 'web', $2::jsonb)
+      `,
+      [
+        workspaceId,
+        JSON.stringify({
+          usageKey,
+          bucketKey,
+          creditsConsumed: normalizedCredits,
+          ...payload,
+        }),
+      ]
+    );
+
+    await client.query("commit");
+    return {
+      duplicate: false,
+      snapshot: await selectWorkspaceBillingSnapshot(workspaceId, client),
+    };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
