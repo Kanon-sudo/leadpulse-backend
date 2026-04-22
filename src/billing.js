@@ -1,11 +1,11 @@
 import Stripe from "stripe";
 import {
   findWorkspaceBillingByStripeCustomerId,
+  grantWorkspaceCreditsPurchase,
   getWorkspaceBillingSnapshot,
   hasStripeEventBeenProcessed,
   logStripeEvent,
   upsertWorkspaceBillingCustomer,
-  upsertWorkspaceBillingSubscription,
 } from "./db.js";
 
 const stripeApiVersion = "2026-02-25.clover";
@@ -154,10 +154,13 @@ export async function createCheckoutSession({
   );
 
   const session = await stripe.checkout.sessions.create({
-    mode: "subscription",
+    mode: "payment",
     customer: customerId,
     client_reference_id: workspace.id,
     allow_promotion_codes: true,
+    invoice_creation: {
+      enabled: true,
+    },
     line_items: [
       {
         price: priceId,
@@ -170,13 +173,15 @@ export async function createCheckoutSession({
       workspace_id: workspace.id,
       workspace_slug: workspace.slug,
       plan_key: planKey,
+      stripe_price_id: priceId,
       owner_user_id: user.id,
     },
-    subscription_data: {
+    payment_intent_data: {
       metadata: {
         workspace_id: workspace.id,
         workspace_slug: workspace.slug,
         plan_key: planKey,
+        stripe_price_id: priceId,
       },
     },
   });
@@ -190,22 +195,10 @@ export async function createCheckoutSession({
 export async function createCustomerPortalSession({
   workspace,
   billing,
-  returnUrl = "",
 }) {
-  if (!billing?.stripeCustomerId) {
-    throw new Error("Workspace does not have a Stripe customer yet");
-  }
-
-  const stripe = getStripeClient();
-  const session = await stripe.billingPortal.sessions.create({
-    customer: billing.stripeCustomerId,
-    return_url: buildAbsoluteUrl(returnUrl, `/pricing/?portal=return&workspace=${workspace.slug}`),
-  });
-
-  return {
-    id: session.id,
-    url: session.url,
-  };
+  void workspace;
+  void billing;
+  throw new Error("Customer portal is disabled for one-time credit packs");
 }
 
 export function verifyStripeWebhookEvent(rawBody, signature) {
@@ -245,28 +238,9 @@ async function resolveWorkspaceContextFromStripeObject(stripeObject) {
   return null;
 }
 
-async function syncSubscriptionRecordToWorkspace(workspaceContext, subscription, billingEmail = "") {
-  if (!workspaceContext?.workspace) {
-    return null;
-  }
-
-  const snapshot = extractSubscriptionSnapshot(subscription, billingEmail);
-  const planKey =
-    subscription?.metadata?.plan_key
-    || resolvePlanKeyFromPriceId(snapshot.stripePriceId)
-    || workspaceContext.workspace.planKey;
-
-  return upsertWorkspaceBillingSubscription({
-    workspaceId: workspaceContext.workspace.id,
-    planKey,
-    ...snapshot,
-  });
-}
-
 async function handleCheckoutCompleted(event) {
   const session = event.data.object;
-
-  if (session.mode !== "subscription" || !session.subscription) {
+  if (session.mode !== "payment" || session.payment_status !== "paid") {
     return { workspaceId: session.client_reference_id || null, ignored: true };
   }
 
@@ -275,35 +249,33 @@ async function handleCheckoutCompleted(event) {
     return { workspaceId: null, ignored: true };
   }
 
-  const stripe = getStripeClient();
-  const subscriptionId =
-    typeof session.subscription === "string"
-      ? session.subscription
-      : session.subscription.id;
-  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  const planKey =
+    session?.metadata?.plan_key
+    || resolvePlanKeyFromPriceId(session?.metadata?.stripe_price_id)
+    || workspaceContext.workspace.planKey;
+  const stripeCustomerId =
+    typeof session.customer === "string"
+      ? session.customer
+      : session.customer?.id || "";
+  const paymentIntentId =
+    typeof session.payment_intent === "string"
+      ? session.payment_intent
+      : session.payment_intent?.id || "";
 
-  await syncSubscriptionRecordToWorkspace(
-    workspaceContext,
-    subscription,
-    session.customer_details?.email || workspaceContext.billing.billingEmail
-  );
-
-  return { workspaceId: workspaceContext.workspace.id, ignored: false };
-}
-
-async function handleSubscriptionUpdated(event) {
-  const subscription = event.data.object;
-  const workspaceContext = await resolveWorkspaceContextFromStripeObject(subscription);
-
-  if (!workspaceContext?.workspace) {
-    return { workspaceId: null, ignored: true };
-  }
-
-  await syncSubscriptionRecordToWorkspace(
-    workspaceContext,
-    subscription,
-    workspaceContext.billing.billingEmail
-  );
+  await grantWorkspaceCreditsPurchase({
+    workspaceId: workspaceContext.workspace.id,
+    eventId: event.id,
+    checkoutSessionId: session.id || "",
+    paymentIntentId,
+    stripeCustomerId,
+    stripePriceId: session?.metadata?.stripe_price_id || "",
+    stripeProductId: "",
+    billingEmail: session.customer_details?.email || workspaceContext.billing.billingEmail,
+    amountTotal: Number(session.amount_total || 0),
+    currency: String(session.currency || "").toLowerCase(),
+    planKey,
+    payload: session,
+  });
 
   return { workspaceId: workspaceContext.workspace.id, ignored: false };
 }
@@ -317,12 +289,8 @@ export async function processStripeWebhookEvent(event) {
 
   switch (event.type) {
     case "checkout.session.completed":
+    case "checkout.session.async_payment_succeeded":
       outcome = await handleCheckoutCompleted(event);
-      break;
-    case "customer.subscription.created":
-    case "customer.subscription.updated":
-    case "customer.subscription.deleted":
-      outcome = await handleSubscriptionUpdated(event);
       break;
     default:
       outcome = { workspaceId: null, ignored: true };

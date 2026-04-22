@@ -30,6 +30,9 @@ export const pool = new Pool({
 let billingSchemaEnsured = false;
 
 const billingSchemaSql = `
+  alter table workspaces
+    alter column plan_key set default 'free';
+
   create table if not exists workspace_billing (
     workspace_id uuid primary key references workspaces(id) on delete cascade,
     stripe_customer_id text unique,
@@ -76,12 +79,32 @@ const billingSchemaSql = `
     created_at timestamptz not null default now()
   );
 
+  create table if not exists workspace_credit_purchases (
+    id uuid primary key default gen_random_uuid(),
+    workspace_id uuid not null references workspaces(id) on delete cascade,
+    stripe_event_id text unique,
+    stripe_checkout_session_id text unique,
+    stripe_payment_intent_id text,
+    stripe_customer_id text,
+    stripe_price_id text,
+    stripe_product_id text,
+    plan_key text not null,
+    credits_granted integer not null default 0,
+    amount_total integer not null default 0,
+    currency text,
+    billing_email text,
+    payload jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now()
+  );
+
   create index if not exists workspace_billing_status_idx on workspace_billing (stripe_status, current_period_end desc);
   create index if not exists stripe_event_log_workspace_id_idx on stripe_event_log (workspace_id, created_at desc);
   create index if not exists workspace_credit_usage_workspace_id_idx on workspace_credit_usage_events (workspace_id, created_at desc);
+  create index if not exists workspace_credit_purchases_workspace_id_idx on workspace_credit_purchases (workspace_id, created_at desc);
 `;
 
 const PLAN_CREDITS = {
+  free: 0,
   starter: 5000,
   growth: 25000,
   ops: 100000,
@@ -146,8 +169,8 @@ async function ensureWorkspace(client, userId, seedName) {
   const workspaceName = seedName || "Leadpulse Workspace";
   const workspaceInsert = await client.query(
     `
-      insert into workspaces (slug, name, owner_user_id)
-      values ($1, $2, $3)
+      insert into workspaces (slug, name, owner_user_id, plan_key)
+      values ($1, $2, $3, 'free')
       returning id, slug, name, plan_key, status
     `,
     [slug, workspaceName, userId]
@@ -305,6 +328,80 @@ async function ensureWorkspaceCreditsRow(client, workspaceId, planKey) {
   );
 }
 
+async function normalizeLegacyWorkspaceEntitlements(client, workspaceRow, creditsRow) {
+  if (!workspaceRow) {
+    return { workspaceRow, creditsRow };
+  }
+
+  const planKey = String(workspaceRow.plan_key || "").trim().toLowerCase();
+  const eligiblePlanCredits = resolvePlanCredits(planKey);
+  const includedCredits = Math.max(Number(creditsRow?.included_credits || 0), 0);
+  const purchasedCredits = Math.max(Number(creditsRow?.purchased_credits || 0), 0);
+  const bonusCredits = Math.max(Number(creditsRow?.bonus_credits || 0), 0);
+  const consumedCredits = Math.max(Number(creditsRow?.consumed_credits || 0), 0);
+
+  if (!eligiblePlanCredits || planKey === "free") {
+    return { workspaceRow, creditsRow };
+  }
+
+  if (workspaceRow.stripe_price_id || workspaceRow.stripe_subscription_id) {
+    return { workspaceRow, creditsRow };
+  }
+
+  if (purchasedCredits > 0 || bonusCredits > 0 || consumedCredits > 0) {
+    return { workspaceRow, creditsRow };
+  }
+
+  if (includedCredits !== eligiblePlanCredits) {
+    return { workspaceRow, creditsRow };
+  }
+
+  const purchaseHistory = await client.query(
+    `
+      select 1
+      from workspace_credit_purchases
+      where workspace_id = $1
+      limit 1
+    `,
+    [workspaceRow.id]
+  );
+
+  if (purchaseHistory.rows[0]) {
+    return { workspaceRow, creditsRow };
+  }
+
+  await client.query(
+    `
+      update workspaces
+      set plan_key = 'free',
+          updated_at = now()
+      where id = $1
+    `,
+    [workspaceRow.id]
+  );
+
+  await client.query(
+    `
+      update workspace_credits
+      set included_credits = 0,
+          updated_at = now()
+      where workspace_id = $1
+    `,
+    [workspaceRow.id]
+  );
+
+  return {
+    workspaceRow: {
+      ...workspaceRow,
+      plan_key: "free",
+    },
+    creditsRow: {
+      ...creditsRow,
+      included_credits: 0,
+    },
+  };
+}
+
 async function selectWorkspaceBillingSnapshot(workspaceId, client = pool) {
   await ensureBillingSchema();
   const result = await client.query(
@@ -359,17 +456,18 @@ async function selectWorkspaceBillingSnapshot(workspaceId, client = pool) {
     `,
     [workspaceId]
   );
+  const normalized = await normalizeLegacyWorkspaceEntitlements(client, row, creditsResult.rows[0]);
 
   return {
     workspace: {
-      id: row.id,
-      slug: row.slug,
-      name: row.name,
-      planKey: row.plan_key,
-      status: row.status,
+      id: normalized.workspaceRow.id,
+      slug: normalized.workspaceRow.slug,
+      name: normalized.workspaceRow.name,
+      planKey: normalized.workspaceRow.plan_key,
+      status: normalized.workspaceRow.status,
     },
-    billing: mapWorkspaceBillingRow(row),
-    credits: mapWorkspaceCreditsRow(creditsResult.rows[0]),
+    billing: mapWorkspaceBillingRow(normalized.workspaceRow),
+    credits: mapWorkspaceCreditsRow(normalized.creditsRow),
   };
 }
 
@@ -553,6 +651,179 @@ export async function logStripeEvent({ eventId, eventType, workspaceId = null, p
     `,
     [eventId, eventType, workspaceId, JSON.stringify(payload || {})]
   );
+}
+
+export async function grantWorkspaceCreditsPurchase({
+  workspaceId,
+  eventId = "",
+  checkoutSessionId = "",
+  paymentIntentId = "",
+  stripeCustomerId = "",
+  stripePriceId = "",
+  stripeProductId = "",
+  billingEmail = "",
+  amountTotal = 0,
+  currency = "",
+  planKey = "",
+  payload = {},
+}) {
+  const normalizedPlanKey = String(planKey || "").trim().toLowerCase();
+  const creditsGranted = resolvePlanCredits(normalizedPlanKey);
+
+  if (!workspaceId) {
+    throw new Error("Missing workspaceId for credit purchase");
+  }
+
+  if (!creditsGranted) {
+    throw new Error(`Unsupported plan key for credit purchase: ${normalizedPlanKey}`);
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("begin");
+    await ensureWorkspaceCreditsRow(client, workspaceId, "free");
+
+    const purchaseInsert = await client.query(
+      `
+        insert into workspace_credit_purchases (
+          workspace_id,
+          stripe_event_id,
+          stripe_checkout_session_id,
+          stripe_payment_intent_id,
+          stripe_customer_id,
+          stripe_price_id,
+          stripe_product_id,
+          plan_key,
+          credits_granted,
+          amount_total,
+          currency,
+          billing_email,
+          payload
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+        on conflict (stripe_checkout_session_id) do nothing
+        returning id
+      `,
+      [
+        workspaceId,
+        eventId || null,
+        checkoutSessionId || null,
+        paymentIntentId || null,
+        stripeCustomerId || null,
+        stripePriceId || null,
+        stripeProductId || null,
+        normalizedPlanKey,
+        creditsGranted,
+        Math.max(Number(amountTotal || 0), 0),
+        currency || null,
+        billingEmail || null,
+        JSON.stringify(payload || {}),
+      ]
+    );
+
+    if (!purchaseInsert.rows[0]) {
+      await client.query("commit");
+      return {
+        duplicate: true,
+        snapshot: await selectWorkspaceBillingSnapshot(workspaceId, client),
+      };
+    }
+
+    await client.query(
+      `
+        update workspace_credits
+        set purchased_credits = purchased_credits + $2,
+            updated_at = now()
+        where workspace_id = $1
+      `,
+      [workspaceId, creditsGranted]
+    );
+
+    await client.query(
+      `
+        update workspaces
+        set plan_key = $2,
+            updated_at = now()
+        where id = $1
+      `,
+      [workspaceId, normalizedPlanKey]
+    );
+
+    await client.query(
+      `
+        insert into workspace_billing (
+          workspace_id,
+          stripe_customer_id,
+          stripe_subscription_id,
+          stripe_price_id,
+          stripe_product_id,
+          stripe_status,
+          billing_email,
+          current_period_start,
+          current_period_end,
+          cancel_at_period_end,
+          trial_start,
+          trial_end,
+          raw_subscription,
+          updated_at
+        )
+        values ($1, $2, null, $3, $4, 'active', $5, null, null, false, null, null, $6::jsonb, now())
+        on conflict (workspace_id)
+        do update set
+          stripe_customer_id = coalesce(excluded.stripe_customer_id, workspace_billing.stripe_customer_id),
+          stripe_subscription_id = null,
+          stripe_price_id = excluded.stripe_price_id,
+          stripe_product_id = excluded.stripe_product_id,
+          stripe_status = excluded.stripe_status,
+          billing_email = coalesce(excluded.billing_email, workspace_billing.billing_email),
+          current_period_start = null,
+          current_period_end = null,
+          cancel_at_period_end = false,
+          trial_start = null,
+          trial_end = null,
+          raw_subscription = excluded.raw_subscription,
+          updated_at = now()
+      `,
+      [
+        workspaceId,
+        stripeCustomerId || null,
+        stripePriceId || null,
+        stripeProductId || null,
+        billingEmail || null,
+        JSON.stringify(payload || {}),
+      ]
+    );
+
+    await client.query(
+      `
+        insert into access_events (workspace_id, event_type, source, payload)
+        values ($1, 'credits_purchased', 'stripe-webhook', $2::jsonb)
+      `,
+      [
+        workspaceId,
+        JSON.stringify({
+          checkoutSessionId,
+          paymentIntentId,
+          planKey: normalizedPlanKey,
+          creditsGranted,
+          amountTotal: Math.max(Number(amountTotal || 0), 0),
+          currency,
+        }),
+      ]
+    );
+
+    await client.query("commit");
+    return {
+      duplicate: false,
+      snapshot: await selectWorkspaceBillingSnapshot(workspaceId, client),
+    };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function consumeWorkspaceCredits({
