@@ -13,6 +13,25 @@ import {
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 8787);
 
+function getInternalOwnerEmails() {
+  return String(process.env.LEADPULSE_INTERNAL_OWNER_EMAILS || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function resolveInternalAccess(email = "") {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const isOwnerBypass = normalizedEmail
+    ? getInternalOwnerEmails().includes(normalizedEmail)
+    : false;
+
+  return {
+    isOwnerBypass,
+    role: isOwnerBypass ? "platform_owner" : "customer",
+  };
+}
+
 function json(response, statusCode, payload) {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
@@ -69,10 +88,12 @@ async function requireSession(request) {
     ...verifiedToken,
     source: String(body.source || "web"),
   });
+  const internalAccess = resolveInternalAccess(verifiedToken.email || session.user?.email || "");
 
   return {
     body,
     session,
+    internalAccess,
   };
 }
 
@@ -114,12 +135,13 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/auth/session") {
-      const { session } = await requireSession(request);
+      const { session, internalAccess } = await requireSession(request);
 
       json(response, 200, {
         ok: true,
         user: session.user,
         workspace: session.workspace,
+        internalAccess,
       });
       return;
     }
@@ -141,6 +163,7 @@ const server = http.createServer(async (request, response) => {
         source: "billing-state",
       });
       const billing = await getBillingState(session.workspace.id);
+      const internalAccess = resolveInternalAccess(verifiedToken.email || session.user?.email || "");
 
       json(response, 200, {
         ok: true,
@@ -148,6 +171,7 @@ const server = http.createServer(async (request, response) => {
         workspace: billing?.workspace || session.workspace,
         billing: billing?.billing || null,
         credits: billing?.credits || null,
+        internalAccess,
       });
       return;
     }
@@ -188,7 +212,7 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/credits/consume") {
-      const { body, session } = await requireSession(request);
+      const { body, session, internalAccess } = await requireSession(request);
       const usageKey = String(body.usageKey || "").trim();
       const bucketKey = String(body.bucketKey || "").trim().toLowerCase();
       const creditsConsumed = Number(body.creditsConsumed || 0);
@@ -200,6 +224,25 @@ const server = http.createServer(async (request, response) => {
 
       if (!["clean", "review", "remove"].includes(bucketKey)) {
         json(response, 400, { ok: false, error: "Invalid bucketKey" });
+        return;
+      }
+
+      if (internalAccess.isOwnerBypass) {
+        const billingSnapshot = await getBillingState(session.workspace.id);
+
+        json(response, 200, {
+          ok: true,
+          duplicate: false,
+          internalAccess,
+          workspace: billingSnapshot?.workspace || session.workspace,
+          billing: billingSnapshot?.billing || null,
+          credits: billingSnapshot?.credits || null,
+          usage: {
+            skipped: true,
+            reason: "owner_bypass",
+            requestedCredits: Math.max(creditsConsumed, 0),
+          },
+        });
         return;
       }
 
@@ -219,6 +262,7 @@ const server = http.createServer(async (request, response) => {
       json(response, 200, {
         ok: true,
         duplicate: outcome.duplicate,
+        internalAccess,
         workspace: outcome.snapshot?.workspace || session.workspace,
         billing: outcome.snapshot?.billing || null,
         credits: outcome.snapshot?.credits || null,
