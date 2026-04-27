@@ -128,13 +128,8 @@ function isLowQualityLocalPart(localPart) {
     return false;
   }
 
-  const digits = compacted.replace(/\D/g, "");
-  if (digits.length >= 6 || (digits.length >= 4 && digits.length / compacted.length >= 0.45)) {
-    return true;
-  }
-
-  if (/^[a-f0-9]{12,}$/i.test(compacted)) {
-    return true;
+  if (isHighRiskLocalPart(localPart)) {
+    return false;
   }
 
   const letters = compacted.replace(/[^a-z]/gi, "");
@@ -142,6 +137,24 @@ function isLowQualityLocalPart(localPart) {
     const vowels = (letters.match(/[aeiou]/gi) || []).length;
     const consonantRuns = letters.match(/[^aeiou]{5,}/gi) || [];
     return vowels / letters.length < 0.18 || consonantRuns.length > 0;
+  }
+
+  return false;
+}
+
+function isHighRiskLocalPart(localPart) {
+  const compacted = String(localPart || "").replace(/[._%+-]/g, "");
+  if (compacted.length < 8) {
+    return false;
+  }
+
+  const digits = compacted.replace(/\D/g, "");
+  if (digits.length >= 6 || (digits.length >= 4 && digits.length / compacted.length >= 0.45)) {
+    return true;
+  }
+
+  if (/^[a-f0-9]{12,}$/i.test(compacted)) {
+    return true;
   }
 
   return false;
@@ -221,7 +234,8 @@ function analyzeLocal(email) {
   if (/[^a-z0-9.!#$%&'*+/=?^_`{|}~-]/i.test(localPart)) hardIssues.push("Caracteres no validos");
   if (reservedDomains.has(domain)) hardIssues.push("Dominio reservado o de prueba");
   if (isDisposableDomain(domain)) hardIssues.push("Dominio temporal o desechable");
-  if (isLowQualityLocalPart(localPart)) hardIssues.push("Local part aleatorio o de baja calidad");
+  if (isHighRiskLocalPart(localPart)) hardIssues.push("Local part aleatorio o de baja calidad");
+  else if (isLowQualityLocalPart(localPart)) warnings.push("Local part inusual, revisar manualmente");
   if (rolePrefixes.has(localPart)) hardIssues.push(localPart === "noreply" || localPart === "no-reply" ? "Correo tipo noreply" : "Cuenta de rol");
   if (localPart.length > 64) hardIssues.push("Usuario demasiado largo");
   if (normalized.length > 254) hardIssues.push("Email demasiado largo");
