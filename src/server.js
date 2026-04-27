@@ -1,6 +1,7 @@
 import http from "node:http";
 import { URL } from "node:url";
 import { consumeWorkspaceCredits, ensureBillingSchema, pingDatabase, syncUserSession } from "./db.js";
+import { verifyEmailAddress, verifyEmailBatch } from "./email-verification.js";
 import { verifyFirebaseIdToken } from "./firebase-auth.js";
 import {
   createCheckoutSession,
@@ -266,6 +267,48 @@ const server = http.createServer(async (request, response) => {
         workspace: outcome.snapshot?.workspace || session.workspace,
         billing: outcome.snapshot?.billing || null,
         credits: outcome.snapshot?.credits || null,
+      });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/verify/email") {
+      const { body } = await requireSession(request);
+      const email = String(body.email || "").trim();
+
+      if (!email) {
+        json(response, 400, { ok: false, error: "Missing email" });
+        return;
+      }
+
+      const verification = await verifyEmailAddress(email, {
+        dns: body.dns !== false,
+        smtp: body.smtp !== false,
+      });
+
+      json(response, 200, {
+        ok: true,
+        verification,
+      });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/verify/bulk") {
+      const { body } = await requireSession(request);
+      const emails = Array.isArray(body.emails) ? body.emails : [];
+
+      if (!emails.length) {
+        json(response, 400, { ok: false, error: "Missing emails array" });
+        return;
+      }
+
+      const batch = await verifyEmailBatch(emails, {
+        dns: body.dns !== false,
+        smtp: body.smtp !== false,
+      });
+
+      json(response, 200, {
+        ok: true,
+        batch,
       });
       return;
     }
