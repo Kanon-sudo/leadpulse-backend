@@ -101,6 +101,23 @@ const rolePrefixes = new Set([
   "webmaster",
 ]);
 
+const operationalAliasTokens = new Set([
+  "asist",
+  "asistente",
+  "comp",
+  "compras",
+  "comunicacion",
+  "gte",
+  "gtech",
+  "gterh",
+  "gterrhh",
+  "hr",
+  "mgr",
+  "plantmgr",
+  "rh",
+  "rrhh",
+]);
+
 const suspiciousTlds = new Set(["zip", "mov", "xyz", "click", "top", "loan", "work"]);
 
 function normalizeEmail(value) {
@@ -158,6 +175,26 @@ function isHighRiskLocalPart(localPart) {
   }
 
   return false;
+}
+
+function isOperationalAliasLocalPart(localPart) {
+  const value = String(localPart || "").toLowerCase();
+  const compacted = value.replace(/[._%+-]/g, "");
+  const tokens = value.split(/[._%+-]+/).filter(Boolean);
+
+  if (/^h\d{3,}[-._]?[a-z]{2}\d?$/i.test(value)) {
+    return true;
+  }
+
+  if (/^asist[a-z0-9]{4,}$/i.test(compacted) || /^gterr?h?[a-z0-9]{3,}$/i.test(compacted)) {
+    return true;
+  }
+
+  if (/^(comp|plantmgr|mhmxcomunicacion|mtygtech)[a-z0-9]*$/i.test(compacted)) {
+    return true;
+  }
+
+  return tokens.some((token) => operationalAliasTokens.has(token));
 }
 
 function getCached(cache, key) {
@@ -235,6 +272,7 @@ function analyzeLocal(email) {
   if (reservedDomains.has(domain)) hardIssues.push("Dominio reservado o de prueba");
   if (isDisposableDomain(domain)) hardIssues.push("Dominio temporal o desechable");
   if (isHighRiskLocalPart(localPart)) hardIssues.push("Local part aleatorio o de baja calidad");
+  else if (isOperationalAliasLocalPart(localPart)) hardIssues.push("Alias operativo o departamental");
   else if (isLowQualityLocalPart(localPart)) warnings.push("Local part inusual, revisar manualmente");
   if (rolePrefixes.has(localPart)) hardIssues.push(localPart === "noreply" || localPart === "no-reply" ? "Correo tipo noreply" : "Cuenta de rol");
   if (localPart.length > 64) hardIssues.push("Usuario demasiado largo");
