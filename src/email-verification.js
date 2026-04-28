@@ -5,7 +5,9 @@ import { setTimeout as delay } from "node:timers/promises";
 const dnsCache = new Map();
 const emailCache = new Map();
 const domainCacheTtlMs = Number(process.env.LEADPULSE_VERIFY_DOMAIN_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
-const emailCacheTtlMs = Number(process.env.LEADPULSE_VERIFY_EMAIL_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const validEmailCacheTtlMs = Number(process.env.LEADPULSE_VERIFY_VALID_EMAIL_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const riskyEmailCacheTtlMs = Number(process.env.LEADPULSE_VERIFY_RISKY_EMAIL_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
+const invalidEmailCacheTtlMs = Number(process.env.LEADPULSE_VERIFY_INVALID_EMAIL_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 const dnsTimeoutMs = Number(process.env.LEADPULSE_VERIFY_DNS_TIMEOUT_MS || 6000);
 const rdapTimeoutMs = Number(process.env.LEADPULSE_VERIFY_RDAP_TIMEOUT_MS || 4500);
 const smtpTimeoutMs = Number(process.env.LEADPULSE_SMTP_TIMEOUT_MS || 5000);
@@ -472,9 +474,23 @@ function deriveStatus(hardIssues, warnings, smtp) {
   return { status: "valid", subStatus: "clean", score: smtp?.status === "accepted" ? 95 : 90 };
 }
 
+function resolveEmailCacheTtl(result) {
+  if (result.status === "valid") {
+    return validEmailCacheTtlMs;
+  }
+
+  if (result.status === "risky") {
+    return riskyEmailCacheTtlMs;
+  }
+
+  return invalidEmailCacheTtlMs;
+}
+
 export async function verifyEmailAddress(email, options = {}) {
   const normalized = normalizeEmail(email);
-  const cacheKey = `${normalized}:${smtpProbeEnabled ? "smtp" : "nosmtp"}`;
+  const dnsEnabled = options.dns !== false;
+  const shouldProbeSmtp = smtpProbeEnabled && options.smtp === true;
+  const cacheKey = `${normalized}:${dnsEnabled ? "dns" : "nodns"}:${shouldProbeSmtp ? "smtp" : "nosmtp"}`;
   const cached = getCached(emailCache, cacheKey);
   if (cached) {
     return { ...cached, cached: true };
@@ -484,13 +500,13 @@ export async function verifyEmailAddress(email, options = {}) {
   const hardIssues = [...local.hardIssues];
   const warnings = [...local.warnings];
   let dnsResult = null;
-  let smtp = { enabled: smtpProbeEnabled, status: "skipped" };
+  let smtp = { enabled: shouldProbeSmtp, status: "skipped" };
 
-  if (local.domain && !hardIssues.length && options.dns !== false) {
+  if (local.domain && !hardIssues.length && dnsEnabled) {
     dnsResult = await lookupDomain(local.domain);
     applyDnsFindings(dnsResult, hardIssues, warnings);
 
-    if (options.smtp !== false && !hardIssues.length) {
+    if (shouldProbeSmtp && !hardIssues.length) {
       smtp = await smtpProbe(local.normalized, dnsResult.mx || []);
       if (smtp.status === "catch_all") warnings.push("Catch-all detectado");
       if (smtp.status === "rejected") hardIssues.push("SMTP rechazo el buzon");
@@ -512,7 +528,7 @@ export async function verifyEmailAddress(email, options = {}) {
     cached: false,
   };
 
-  setCached(emailCache, cacheKey, result, emailCacheTtlMs);
+  setCached(emailCache, cacheKey, result, resolveEmailCacheTtl(result));
   return result;
 }
 

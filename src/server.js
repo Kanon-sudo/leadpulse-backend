@@ -5,7 +5,6 @@ import { verifyEmailAddress, verifyEmailBatch } from "./email-verification.js";
 import { verifyFirebaseIdToken } from "./firebase-auth.js";
 import {
   createCheckoutSession,
-  createCustomerPortalSession,
   getBillingState,
   processStripeWebhookEvent,
   verifyStripeWebhookEvent,
@@ -13,6 +12,19 @@ import {
 
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 8787);
+const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+const corsOrigin = String(process.env.CORS_ORIGIN || "").trim();
+
+if (isProduction && !corsOrigin) {
+  throw new Error("CORS_ORIGIN is required in production");
+}
+
+class HttpError extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.statusCode = statusCode;
+  }
+}
 
 function getInternalOwnerEmails() {
   return String(process.env.LEADPULSE_INTERNAL_OWNER_EMAILS || "")
@@ -36,7 +48,7 @@ function resolveInternalAccess(email = "") {
 function json(response, statusCode, payload) {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
+    "Access-Control-Allow-Origin": corsOrigin || "*",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   });
@@ -63,7 +75,11 @@ async function readJsonBody(request) {
   }
 
   const raw = Buffer.concat(chunks).toString("utf8");
-  return JSON.parse(raw);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new HttpError(400, "Invalid JSON body");
+  }
 }
 
 async function readRawBody(request) {
@@ -81,7 +97,7 @@ async function requireSession(request) {
   const idToken = getBearerToken(request) || String(body.idToken || "").trim();
 
   if (!idToken) {
-    throw new Error("Missing idToken. Send it in Authorization: Bearer <token> or as { idToken }.");
+    throw new HttpError(401, "Missing idToken. Send it in Authorization: Bearer <token> or as { idToken }.");
   }
 
   const verifiedToken = await verifyFirebaseIdToken(idToken);
@@ -106,7 +122,7 @@ const server = http.createServer(async (request, response) => {
 
   if (request.method === "OPTIONS") {
     response.writeHead(204, {
-      "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
+      "Access-Control-Allow-Origin": corsOrigin || "*",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     });
@@ -196,18 +212,10 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/billing/customer-portal") {
-      const { body, session } = await requireSession(request);
-      const billingSnapshot = await getBillingState(session.workspace.id);
-
-      const portal = await createCustomerPortalSession({
-        workspace: billingSnapshot?.workspace || session.workspace,
-        billing: billingSnapshot?.billing,
-        returnUrl: String(body.returnUrl || ""),
-      });
-
-      json(response, 200, {
-        ok: true,
-        portal,
+      await requireSession(request);
+      json(response, 410, {
+        ok: false,
+        error: "Customer portal is disabled for one-time credit packs.",
       });
       return;
     }
@@ -282,7 +290,7 @@ const server = http.createServer(async (request, response) => {
 
       const verification = await verifyEmailAddress(email, {
         dns: body.dns !== false,
-        smtp: body.smtp !== false,
+        smtp: body.smtp === true,
       });
 
       json(response, 200, {
@@ -303,7 +311,7 @@ const server = http.createServer(async (request, response) => {
 
       const batch = await verifyEmailBatch(emails, {
         dns: body.dns !== false,
-        smtp: body.smtp !== false,
+        smtp: body.smtp === true,
       });
 
       json(response, 200, {
@@ -331,9 +339,8 @@ const server = http.createServer(async (request, response) => {
     json(response, 404, { ok: false, error: "Not found" });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown server error";
-    const isAuthError = message.startsWith("Missing idToken");
     const isStripeSignatureError = message.toLowerCase().includes("signature");
-    const statusCode = isAuthError ? 401 : isStripeSignatureError ? 400 : 500;
+    const statusCode = error instanceof HttpError ? error.statusCode : isStripeSignatureError ? 400 : 500;
 
     json(response, statusCode, {
       ok: false,

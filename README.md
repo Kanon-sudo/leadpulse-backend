@@ -25,17 +25,19 @@ Required env vars:
 - `STRIPE_PRICE_STARTER_MONTHLY`
 - `STRIPE_PRICE_GROWTH_MONTHLY`
 - `STRIPE_PRICE_OPS_MONTHLY`
+- `CORS_ORIGIN=https://leadpulse.email` (required when `NODE_ENV=production`)
 
 Optional:
 
 - `LEADPULSE_DB_SSLMODE=require`
-- `CORS_ORIGIN=https://leadpulse.email`
 - `HOST=127.0.0.1`
 - `PORT=8787`
 - `PUBLIC_APP_URL=https://leadpulse.email`
 - `LEADPULSE_VERIFY_MAX_BATCH=1000`
 - `LEADPULSE_VERIFY_DOMAIN_CACHE_TTL_MS=86400000`
-- `LEADPULSE_VERIFY_EMAIL_CACHE_TTL_MS=604800000`
+- `LEADPULSE_VERIFY_VALID_EMAIL_CACHE_TTL_MS=604800000`
+- `LEADPULSE_VERIFY_RISKY_EMAIL_CACHE_TTL_MS=86400000`
+- `LEADPULSE_VERIFY_INVALID_EMAIL_CACHE_TTL_MS=21600000`
 - `LEADPULSE_VERIFY_DNS_TIMEOUT_MS=6000`
 - `LEADPULSE_VERIFY_RDAP_TIMEOUT_MS=4500`
 - `LEADPULSE_SMTP_PROBE_ENABLED=false`
@@ -65,4 +67,4 @@ Email verification endpoints require the same Firebase bearer token as the billi
 }
 ```
 
-SMTP probing is disabled by default. Enable it only from a VPS/network that allows outbound port 25 and after configuring a sender domain with sane DNS/reputation.
+SMTP probing is disabled by default and is opt-in per request (`smtp: true`). Enable it only from a VPS/network that allows outbound port 25 and after configuring a sender domain with sane DNS/reputation.
