@@ -110,6 +110,40 @@ const PLAN_CREDITS = {
   ops: 100000,
 };
 
+const PLAN_RANK = {
+  free: 0,
+  starter: 1,
+  growth: 2,
+  ops: 3,
+};
+
+function normalizePlanKey(planKey) {
+  const normalizedPlanKey = String(planKey || "").trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(PLAN_CREDITS, normalizedPlanKey) ? normalizedPlanKey : "free";
+}
+
+async function updateWorkspacePlanIfHigher(client, workspaceId, nextPlanKey) {
+  const normalizedPlanKey = normalizePlanKey(nextPlanKey);
+
+  await client.query(
+    `
+      update workspaces
+      set plan_key = case
+            when case plan_key
+              when 'ops' then 3
+              when 'growth' then 2
+              when 'starter' then 1
+              else 0
+            end >= $3 then plan_key
+            else $2
+          end,
+          updated_at = now()
+      where id = $1
+    `,
+    [workspaceId, normalizedPlanKey, PLAN_RANK[normalizedPlanKey]]
+  );
+}
+
 export async function pingDatabase() {
   const result = await pool.query(
     "select current_database() as database, current_user as user, now() as server_time"
@@ -191,36 +225,96 @@ async function ensureWorkspace(client, userId, seedName) {
   return workspace;
 }
 
+async function upsertSessionUser(client, session) {
+  const firebaseUid = String(session.firebaseUid || "").trim();
+  const email = String(session.email || "").trim().toLowerCase();
+  const displayName = session.displayName || "";
+  const photoUrl = session.photoUrl || "";
+  const authProvider = session.authProvider || "google";
+  const values = [firebaseUid, email, displayName, photoUrl, authProvider];
+  const returningColumns = `
+    id, firebase_uid, email, display_name, photo_url, auth_provider, last_login_at, created_at, updated_at
+  `;
+
+  const existing = await client.query(
+    `
+      select ${returningColumns}
+      from users
+      where firebase_uid = $1 or lower(email) = lower($2)
+      order by case when firebase_uid = $1 then 0 else 1 end, created_at asc
+      limit 1
+      for update
+    `,
+    [firebaseUid, email]
+  );
+
+  if (existing.rows[0]) {
+    const updateResult = await client.query(
+      `
+        update users
+        set firebase_uid = $1,
+            email = $2,
+            display_name = $3,
+            photo_url = $4,
+            auth_provider = $5,
+            last_login_at = now(),
+            updated_at = now()
+        where id = $6
+        returning ${returningColumns}
+      `,
+      [...values, existing.rows[0].id]
+    );
+
+    return updateResult.rows[0];
+  }
+
+  try {
+    const insertResult = await client.query(
+      `
+        insert into users (firebase_uid, email, display_name, photo_url, auth_provider, last_login_at, updated_at)
+        values ($1, $2, $3, $4, $5, now(), now())
+        returning ${returningColumns}
+      `,
+      values
+    );
+
+    return insertResult.rows[0];
+  } catch (error) {
+    if (error?.code !== "23505") {
+      throw error;
+    }
+
+    const updateResult = await client.query(
+      `
+        update users
+        set firebase_uid = $1,
+            email = $2,
+            display_name = $3,
+            photo_url = $4,
+            auth_provider = $5,
+            last_login_at = now(),
+            updated_at = now()
+        where firebase_uid = $1 or lower(email) = lower($2)
+        returning ${returningColumns}
+      `,
+      values
+    );
+
+    if (!updateResult.rows[0]) {
+      throw error;
+    }
+
+    return updateResult.rows[0];
+  }
+}
+
 export async function syncUserSession(session) {
   const client = await pool.connect();
 
   try {
     await client.query("begin");
 
-    const userResult = await client.query(
-      `
-        insert into users (firebase_uid, email, display_name, photo_url, auth_provider, last_login_at, updated_at)
-        values ($1, $2, $3, $4, $5, now(), now())
-        on conflict (firebase_uid)
-        do update set
-          email = excluded.email,
-          display_name = excluded.display_name,
-          photo_url = excluded.photo_url,
-          auth_provider = excluded.auth_provider,
-          last_login_at = excluded.last_login_at,
-          updated_at = excluded.updated_at
-        returning id, firebase_uid, email, display_name, photo_url, auth_provider, last_login_at, created_at, updated_at
-      `,
-      [
-        session.firebaseUid,
-        session.email,
-        session.displayName,
-        session.photoUrl,
-        session.authProvider || "google",
-      ]
-    );
-
-    const user = userResult.rows[0];
+    const user = await upsertSessionUser(client, session);
     const preferredWorkspaceName =
       session.displayName?.trim() ||
       `${String(session.email || "").split("@")[0] || "Leadpulse"} workspace`;
@@ -293,7 +387,7 @@ function mapWorkspaceBillingRow(row) {
 }
 
 function resolvePlanCredits(planKey) {
-  const normalizedPlanKey = String(planKey || "").trim().toLowerCase();
+  const normalizedPlanKey = normalizePlanKey(planKey);
   return PLAN_CREDITS[normalizedPlanKey] || 0;
 }
 
@@ -566,14 +660,7 @@ export async function upsertWorkspaceBillingSubscription({
     );
 
     if (planKey) {
-      await client.query(
-        `
-          update workspaces
-          set plan_key = $2, updated_at = now()
-          where id = $1
-        `,
-        [workspaceId, planKey]
-      );
+      await updateWorkspacePlanIfHigher(client, workspaceId, planKey);
     }
 
     await client.query("commit");
@@ -740,15 +827,7 @@ export async function grantWorkspaceCreditsPurchase({
       [workspaceId, creditsGranted]
     );
 
-    await client.query(
-      `
-        update workspaces
-        set plan_key = $2,
-            updated_at = now()
-        where id = $1
-      `,
-      [workspaceId, normalizedPlanKey]
-    );
+    await updateWorkspacePlanIfHigher(client, workspaceId, normalizedPlanKey);
 
     await client.query(
       `
