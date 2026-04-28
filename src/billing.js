@@ -73,37 +73,6 @@ function resolvePlanKeyFromPriceId(priceId) {
   return Object.entries(catalog).find(([, candidate]) => candidate === priceId)?.[0] || "";
 }
 
-function unixSecondsToDate(value) {
-  return value ? new Date(Number(value) * 1000) : null;
-}
-
-function extractSubscriptionSnapshot(subscription, billingEmail = "") {
-  const primaryItem = subscription?.items?.data?.[0];
-  const price = primaryItem?.price;
-  const productId =
-    typeof price?.product === "string"
-      ? price.product
-      : price?.product?.id || "";
-
-  return {
-    stripeCustomerId:
-      typeof subscription.customer === "string"
-        ? subscription.customer
-        : subscription.customer?.id || "",
-    stripeSubscriptionId: subscription.id || "",
-    stripePriceId: price?.id || "",
-    stripeProductId: productId,
-    stripeStatus: subscription.status || "inactive",
-    billingEmail,
-    currentPeriodStart: unixSecondsToDate(subscription.current_period_start),
-    currentPeriodEnd: unixSecondsToDate(subscription.current_period_end),
-    cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
-    trialStart: unixSecondsToDate(subscription.trial_start),
-    trialEnd: unixSecondsToDate(subscription.trial_end),
-    rawSubscription: subscription,
-  };
-}
-
 async function ensureWorkspaceStripeCustomer({ workspace, user, billing }) {
   if (billing?.stripeCustomerId) {
     return billing.stripeCustomerId;
